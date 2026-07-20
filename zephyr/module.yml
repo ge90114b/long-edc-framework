@@ -1,0 +1,4 @@
+name: long-edc-framework
+build:
+  cmake: .
+  kconfig: Kconfig

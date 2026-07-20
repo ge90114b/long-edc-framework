@@ -1,0 +1,11 @@
+manifest:
+  remotes:
+    - name: ti-msp
+      url-base: https://github.com/TexasInstruments
+
+  projects:
+    - name: zephyr
+      remote: ti-msp
+      repo-path: msp-zephyr
+      revision: f8fc554b7a9efe191e957821e91ad0c22024ac0d
+      import: true

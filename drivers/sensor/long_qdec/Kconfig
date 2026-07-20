@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+
+config LONG_QDEC
+	bool "Long QDEC — GPIO-based Quadrature Decoder"
+	default y
+	depends on DT_HAS_LONG_QDEC_ENABLED
+	help
+	  Quadrature decoder sensor using one GPIO interrupt pin (channel A)
+	  and one GPIO input pin (channel B). Decodes at 2x resolution by
+	  reading channel B on each edge of channel A.

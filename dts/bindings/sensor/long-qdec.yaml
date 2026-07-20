@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  GPIO-based quadrature decoder (QDEC) sensor.
+  Uses one GPIO interrupt (channel A) and one GPIO input (channel B)
+  to decode quadrature encoder signals at 2x resolution.
+
+compatible: "long-qdec"
+
+include: sensor-device.yaml
+
+properties:
+  a-gpios:
+    type: phandle-array
+    required: true
+    description: |
+      Channel A — interrupt pin, configured for both-edge triggering.
+
+  b-gpios:
+    type: phandle-array
+    required: true
+    description: |
+      Channel B — read-only input, sampled in the ISR to determine direction.
+
+  pulses-per-rev:
+    type: int
+    default: 1
+    description: |
+      Number of pulses (full quadrature cycles) per revolution.
+      Set to 0 to get raw step counts.
