@@ -4,3 +4,4 @@
 # Each driver has its own Kconfig sourced below.
 
 rsource "drivers/sensor/long_qdec/Kconfig"
+rsource "drivers/sensor/long_icm45686/Kconfig"

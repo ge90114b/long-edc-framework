@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+
+config LONG_ICM45686
+	bool "Long ICM45686 IMU with integrated VQF orientation filter"
+	default y
+	depends on DT_HAS_LONG_ICM45686_ENABLED && I2C
+	help
+	  ICM45686 6-axis IMU driver with integrated VQF (Versatile Quaternion
+	  Filter) sensor fusion. Uses the sensor's internal 32kHz RC oscillator
+	  — no external crystal required. Outputs orientation (roll/pitch/yaw
+	  in degrees) and debiased angular velocity (rad/s) via the Zephyr
+	  sensor API.
+
+	  ODR is 100 Hz, suitable for M0+/M4 MCUs without FPU.
+	  VQF runs in single-precision (float) mode.

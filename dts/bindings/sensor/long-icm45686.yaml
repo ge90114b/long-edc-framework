@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+
+description: ICM45686 6-axis IMU sensor driver with integrated VQF orientation filter
+
+compatible: "long-icm45686"
+
+include: [sensor-device.yaml, i2c-device.yaml]
+
+properties:
+  int1-gpios:
+    type: phandle-array
+    required: false
+    description: |
+      INT1 pin from ICM45686 (optional).
+      When connected, used for FIFO watermark interrupt.
+      When not connected, driver uses polling mode via sample_fetch.
