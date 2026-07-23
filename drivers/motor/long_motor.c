@@ -74,7 +74,15 @@ static void motor_pid_tick(struct k_work *work)
 
 	k_mutex_lock(&data->lock, K_FOREVER);
 
-	if (!data->initialized || data->target_speed == 0.0f) {
+	if (!data->initialized) {
+		k_mutex_unlock(&data->lock);
+		k_work_schedule(&data->pid_work, K_MSEC(data->pid.period_ms));
+		return;
+	}
+
+	/* 目标转速为 0：停车（PWM 关断）*/
+	if (data->target_speed == 0.0f) {
+		pwm_set_pulse_dt(&cfg->pwm, 0);
 		k_mutex_unlock(&data->lock);
 		k_work_schedule(&data->pid_work, K_MSEC(data->pid.period_ms));
 		return;
@@ -92,7 +100,7 @@ static void motor_pid_tick(struct k_work *work)
 	motor_rpm = sensor_value_to_double(&val);
 
 	sensor_channel_get(cfg->qdec, SENSOR_CHAN_ROTATION, &val);
-	motor_dist = sensor_value_to_double(&val) / 360000.0f; /* milli-deg → rev */
+	motor_dist = sensor_value_to_double(&val) / 360.0; /* deg → motor rev */
 
 	/* 2. 转换为轮子侧 */
 	data->current_speed = motor_rpm / cfg->gear_ratio;
@@ -178,9 +186,15 @@ int motor_set_speed(const struct device *dev, float rpm)
 	}
 
 	k_mutex_lock(&data->lock, K_FOREVER);
+
+	/* 大幅变速（>50%）才复位积分，避免正常巡线时 I 项无效 */
+	float delta = rpm - data->target_speed;
+	if (fabsf(delta) > fabsf(data->target_speed) * 0.5f) {
+		data->pid_integral = 0.0f;
+		data->pid_prev_error = 0.0f;
+	}
 	data->target_speed = rpm;
-	data->pid_integral = 0.0f;
-	data->pid_prev_error = 0.0f;
+
 	k_mutex_unlock(&data->lock);
 
 	return 0;
@@ -220,7 +234,7 @@ void motor_reset_distance(const struct device *dev)
 
 	if (sensor_sample_fetch(cfg->qdec) == 0) {
 		sensor_channel_get(cfg->qdec, SENSOR_CHAN_ROTATION, &val);
-		data->rotation_offset = sensor_value_to_double(&val) / 360000.0f
+		data->rotation_offset = sensor_value_to_double(&val) / 360.0
 					/ cfg->gear_ratio;
 	}
 	data->distance = 0.0f;

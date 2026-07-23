@@ -19,6 +19,7 @@
 #include <zephyr/sys/atomic.h>
 
 #include <stdlib.h>
+#include <string.h>
 
 LOG_MODULE_REGISTER(line_sensor, CONFIG_SENSOR_LOG_LEVEL);
 
@@ -88,7 +89,7 @@ static int cmp_u16(const void *a, const void *b)
 static uint16_t read_channel(const struct device *dev, uint8_t ch, int n_sample)
 {
 	const struct line_sensor_config *cfg = dev->config;
-	uint16_t buf[16];
+	uint16_t buf[32];
 	int16_t val;
 	int err;
 
