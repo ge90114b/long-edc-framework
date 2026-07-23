@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+
+config LONG_LINE_SENSOR
+	bool "Long Line Sensor — 4051 mux + ADC grayscale sensor"
+	default y
+	depends on DT_HAS_LONG_LINE_SENSOR_ENABLED && ADC
+	help
+	  8-channel grayscale line sensor via 4051 analog multiplexer + ADC.
+	  Supports white/black calibration, normalization (0-1000),
+	  and binary thresholding with hysteresis.

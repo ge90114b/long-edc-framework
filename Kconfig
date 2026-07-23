@@ -5,3 +5,5 @@
 
 rsource "drivers/sensor/long_qdec/Kconfig"
 rsource "drivers/sensor/long_icm45686/Kconfig"
+rsource "drivers/motor/Kconfig"
+rsource "drivers/sensor/line_sensor/Kconfig"

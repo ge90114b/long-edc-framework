@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Long EDC Line Sensor driver — 4051 analog multiplexer + ADC.
+  8-channel grayscale sensor for line-following robots.
+
+  S0/S1/S2 address lines switch the 4051 channel, ADC reads the
+  selected sensor. The driver handles mux switching, multi-sample
+  averaging, calibration (white/black), normalization, and
+  binary thresholding.
+
+  Example usage:
+
+      line_sensor: line_sensor {
+          compatible = "long-line-sensor";
+          io-channels = <&adc0 7>;
+          mux-gpios = <&gpiob 3 GPIO_ACTIVE_HIGH>,
+                       <&gpioa 8 GPIO_ACTIVE_HIGH>,
+                       <&gpioa 9 GPIO_ACTIVE_HIGH>;
+          num-sensors = <8>;
+      };
+
+compatible: "long-line-sensor"
+
+include: sensor-device.yaml
+
+properties:
+  io-channels:
+    type: phandle-array
+    required: true
+    description: |
+      ADC channel for the mux output. Single phandle-array pointing
+      to the ADC instance and its input channel.
+
+  mux-gpios:
+    type: phandle-array
+    required: true
+    description: |
+      Three GPIOs for the 4051 address lines: S0 (LSB), S1, S2 (MSB).
+
+  num-sensors:
+    type: int
+    required: true
+    default: 8
+    description: Number of connected sensors (1–8).

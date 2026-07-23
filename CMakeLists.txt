@@ -2,3 +2,5 @@
 
 add_subdirectory_ifdef(CONFIG_LONG_QDEC drivers/sensor/long_qdec)
 add_subdirectory_ifdef(CONFIG_LONG_ICM45686 drivers/sensor/long_icm45686)
+add_subdirectory_ifdef(CONFIG_LONG_MOTOR drivers/motor)
+add_subdirectory_ifdef(CONFIG_LONG_LINE_SENSOR drivers/sensor/line_sensor)

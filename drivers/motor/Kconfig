@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+
+config LONG_MOTOR
+	bool "Long EDC Motor driver with PID speed loop"
+	default y
+	depends on DT_HAS_LONG_MOTOR_ENABLED
+	select PWM
+	help
+	  Motor driver combining PWM speed control, direction GPIO,
+	  and QDEC encoder feedback with a built-in PID speed controller.
+	  gear-ratio is read from devicetree; PID parameters are injected
+	  at runtime via motor_init().
+
+if LONG_MOTOR
+
+config MOTOR_INIT_PRIORITY
+	int "Motor driver init priority"
+	default 95
+	help
+	  POST_KERNEL init priority. Must be higher than SENSOR (90).
+
+config MOTOR_LOG_LEVEL
+	int "Motor driver log level"
+	default 3
+	range 0 4
+	help
+	  0=ERR, 1=WRN, 2=INF, 3=DBG, 4=NONE (Zephyr LOG_LEVEL semantic)
+
+endif # LONG_MOTOR

@@ -1,14 +1,16 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/*
- * GPIO-based Quadrature Decoder (QDEC) sensor driver.
+/**
+ * @file long_qdec.c
+ * @brief GPIO-based Quadrature Decoder (QDEC) sensor driver.
  *
- * Only channel A is configured for both-edge interrupts. Channel B is a
- * plain input read in the ISR to determine direction — 2x resolution.
+ * Channel A is configured for both-edge interrupts. Channel B is a plain
+ * input read in the ISR to determine direction — 2x resolution decoding.
  *
- * Channels:
- *   SENSOR_CHAN_ROTATION  — angular position (degrees or raw steps)
- *   SENSOR_CHAN_RPM       — speed in revolutions per minute
+ * Channels exposed via Zephyr sensor API:
+ *   - SENSOR_CHAN_ROTATION — angular position (milli-degrees or raw steps)
+ *   - SENSOR_CHAN_RPM      — speed in revolutions per minute
  */
+
 #define DT_DRV_COMPAT long_qdec
 
 #include <zephyr/device.h>
@@ -20,25 +22,29 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(qdec_gpio, CONFIG_SENSOR_LOG_LEVEL);
 
+/** @brief ROM — 设备树解析出的硬件参数 */
 struct qdec_config {
-	struct gpio_dt_spec a;       /* interrupt pin */
-	struct gpio_dt_spec b;       /* direction-reference pin */
-	uint32_t pulses_per_rev;
+	struct gpio_dt_spec a;       /**< 通道 A — 中断引脚（双边沿触发） */
+	struct gpio_dt_spec b;       /**< 通道 B — 方向参考引脚（只读） */
+	uint32_t pulses_per_rev;     /**< 每转脉冲数（完整正交周期数），0=原始步数 */
 };
 
+/** @brief RAM — 编码器运行时状态 */
 struct qdec_data {
-	const struct device *dev;
-	struct gpio_callback cb;
-	atomic_t position;           /* ISR writes, sample_fetch snapshots */
-	int32_t fetched;             /* last snapshot for channel_get */
-	int32_t last_position;       /* position at previous fetch */
-	int64_t last_ticks;          /* k_uptime_ticks() at previous fetch */
-	int32_t rpm;                 /* computed speed */
+	const struct device *dev;    /**< 自引用 */
+	struct gpio_callback cb;     /**< GPIO 回调 */
+	atomic_t position;           /**< ISR 原子累加，sample_fetch 快照捕获 */
+	int32_t fetched;             /**< 最后一次快照值（供 channel_get 读取） */
+	int32_t last_position;       /**< 上一次 fetch 时的位置（用于计算速度） */
+	int64_t last_ticks;          /**< 上一次 fetch 时刻（k_uptime_ticks） */
+	int32_t rpm;                 /**< 计算出的转速（RPM） */
 };
 
-/*
- * ISR — fires on both edges of channel A.
- * Direction rule: delta = (A == B) ? -1 : +1
+/**
+ * @brief ISR — 通道 A 双边沿触发。
+ *
+ * 方向规则：delta = (A == B) ? -1 : +1（2x 分辨率）。
+ * 原子操作 position 以与主线程无锁共享。
  */
 static void qdec_isr(const struct device *port, struct gpio_callback *cb,
 		     gpio_port_pins_t pins)
@@ -51,6 +57,16 @@ static void qdec_isr(const struct device *port, struct gpio_callback *cb,
 	atomic_add(&data->position, (a == b) ? -1 : +1);
 }
 
+/**
+ * @brief 原子快照 position 并计算瞬时 RPM。
+ *
+ * RPM = delta_steps / (2 * ppr) * 60 / dt_sec
+ *
+ * @param dev  QDEC 设备
+ * @param chan 采样通道（SENSOR_CHAN_ALL / ROTATION / RPM）
+ * @retval 0 成功
+ * @retval -ENOTSUP 不支持的通道
+ */
 static int qdec_sample_fetch(const struct device *dev, enum sensor_channel chan)
 {
 	struct qdec_data *data = dev->data;
@@ -65,11 +81,9 @@ static int qdec_sample_fetch(const struct device *dev, enum sensor_channel chan)
 		return -ENOTSUP;
 	}
 
-	/* Atomically snapshot current position */
 	cur = atomic_get(&data->position);
 	data->fetched = cur;
 
-	/* Compute speed: RPM = delta_steps / (2 * ppr) * 60 / dt_sec */
 	delta = cur - data->last_position;
 	dt_ticks = now - data->last_ticks;
 
@@ -87,6 +101,15 @@ static int qdec_sample_fetch(const struct device *dev, enum sensor_channel chan)
 	return 0;
 }
 
+/**
+ * @brief 返回缓存的传感器通道值。
+ *
+ * @param dev  QDEC 设备
+ * @param chan SENSOR_CHAN_ROTATION 或 SENSOR_CHAN_RPM
+ * @param val  输出：milli-degrees 或 RPM
+ * @retval 0 成功
+ * @retval -ENOTSUP 不支持的通道
+ */
 static int qdec_channel_get(const struct device *dev, enum sensor_channel chan,
 			    struct sensor_value *val)
 {
@@ -118,11 +141,17 @@ static int qdec_channel_get(const struct device *dev, enum sensor_channel chan,
 	return 0;
 }
 
+/** @brief Zephyr sensor 驱动 API 表 */
 static DEVICE_API(sensor, qdec_api) = {
 	.sample_fetch = qdec_sample_fetch,
 	.channel_get  = qdec_channel_get,
 };
 
+/**
+ * @brief QDEC 硬件初始化 — 配置 GPIO、注册 ISR。
+ *
+ * POST_KERNEL 阶段自动调用。
+ */
 static int qdec_init(const struct device *dev)
 {
 	const struct qdec_config *cfg = dev->config;
@@ -172,6 +201,7 @@ static int qdec_init(const struct device *dev)
 	return 0;
 }
 
+/** @brief 设备注册宏 */
 #define QDEC_GPIO_INIT(n)                                                    \
 	static struct qdec_data qdec_data_##n = {                            \
 		.position = ATOMIC_INIT(0),                                  \

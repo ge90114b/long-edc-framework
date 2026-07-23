@@ -1,16 +1,17 @@
 /* SPDX-License-Identifier: MIT */
-/*
- * ICM45686 6-axis IMU driver with integrated VQF orientation filter.
+/**
+ * @file icm45686.c
+ * @brief ICM45686 6-axis IMU driver with integrated VQF orientation filter.
  *
  * Uses the sensor's internal 32 kHz RC oscillator — no external crystal
  * required.  Runs at 100 Hz ODR with all-float VQF sensor fusion, suitable
  * for Cortex-M0+/M4 MCUs without FPU.
  *
  * Outputs (via Zephyr sensor API):
- *   SENSOR_CHAN_ROTATION_X/Y/Z  — roll / pitch / yaw  (degrees)
- *   SENSOR_CHAN_GYRO_X/Y/Z      — debiased angular velocity (rad/s)
+ *   - SENSOR_CHAN_ROTATION     — yaw (degrees)
+ *   - SENSOR_CHAN_GYRO_X/Y/Z   — debiased angular velocity (rad/s)
  *
- * DTS bindings: dts/bindings/sensor/icm45686.yaml
+ * @see dts/bindings/sensor/long-icm45686.yaml
  */
 
 #define DT_DRV_COMPAT long_icm45686
@@ -31,48 +32,55 @@
 LOG_MODULE_REGISTER(icm45686, LOG_LEVEL_INF);
 
 /* ------------------------------------------------------------------ */
-/*  Per-instance config & data                                        */
+/*  Per-instance data                                                 */
 /* ------------------------------------------------------------------ */
 
+/** @brief ROM — I²C 总线配置 */
 struct icm_config {
 	struct i2c_dt_spec bus;
 };
 
+/** @brief RAM — VQF 状态 + 缓存传感器输出 */
 struct icm_data {
-	/* VQF sensor fusion state */
-	vqf_params_t  vqf_params;
-	vqf_state_t   vqf_state;
-	vqf_coeffs_t  vqf_coeffs;
-	bool          vqf_ready;
+	vqf_params_t  vqf_params;     /**< VQF 可调参数 */
+	vqf_state_t   vqf_state;      /**< VQF 滤波器状态 */
+	vqf_coeffs_t  vqf_coeffs;     /**< VQF 预计算系数 */
+	bool          vqf_ready;      /**< VQF 初始化完成 */
 
-	/* Cached sensor outputs (updated by sample_fetch, read by channel_get) */
-	float euler[3];        /* roll, pitch, yaw  (degrees) */
-	float gyro_debiased[3]; /* debiased angular velocity (rad/s) */
+	float euler[3];               /**< 缓存：roll, pitch, yaw (度) */
+	float gyro_debiased[3];       /**< 缓存：去偏置角速度 (rad/s) */
 
-	/* FIFO read buffer — enough for ~12 packets at 100 Hz */
-	uint8_t fifo_buf[256] __aligned(4);
+	uint8_t fifo_buf[256] __aligned(4); /**< FIFO 读取缓冲 */
+
+	struct k_work_delayable feed_work;  /**< 100Hz 自动喂 VQF */
+	const struct device      *dev;      /**< 自引用 */
+	struct k_mutex lock;                /**< 保护缓存 */
 };
 
 /* ------------------------------------------------------------------ */
 /*  I²C helpers                                                        */
 /* ------------------------------------------------------------------ */
 
+/** @brief 写一字节寄存器 */
 static inline int icm_write(const struct i2c_dt_spec *bus, uint8_t reg, uint8_t val)
 {
 	uint8_t buf[2] = { reg, val };
 	return i2c_write_dt(bus, buf, sizeof(buf));
 }
 
+/** @brief 读一字节寄存器 */
 static inline int icm_read(const struct i2c_dt_spec *bus, uint8_t reg, uint8_t *val)
 {
 	return i2c_reg_read_byte_dt(bus, reg, val);
 }
 
+/** @brief 连续读多字节 */
 static int icm_burst_read(const struct i2c_dt_spec *bus, uint8_t reg, uint8_t *data, size_t len)
 {
 	return i2c_burst_read_dt(bus, reg, data, len);
 }
 
+/** @brief 连续写多字节 */
 static int icm_burst_write(const struct i2c_dt_spec *bus, uint8_t reg, const uint8_t *data, size_t len)
 {
 	uint8_t buf[64];
@@ -89,6 +97,11 @@ static int icm_burst_write(const struct i2c_dt_spec *bus, uint8_t reg, const uin
 /*  IREG access (indirect registers)                                   */
 /* ------------------------------------------------------------------ */
 
+/**
+ * @brief 写一个间接寄存器（IREG）。
+ *
+ * 数据格式：bank | addr | data，发到 ICM45686_IREG_ADDR_15_8。
+ */
 static int icm_write_ireg(const struct i2c_dt_spec *bus,
 			  uint8_t bank, uint8_t addr, uint8_t data)
 {
@@ -96,6 +109,11 @@ static int icm_write_ireg(const struct i2c_dt_spec *bus,
 	return icm_burst_write(bus, ICM45686_IREG_ADDR_15_8, buf, 3);
 }
 
+/**
+ * @brief 读间接寄存器（IREG），支持批量读取。
+ *
+ * 每次 IREG 读取需间隔 ≥ 4 µs（datasheet §5.2）。
+ */
 static int icm_read_ireg(const struct i2c_dt_spec *bus,
 			 uint8_t bank, uint8_t addr, uint8_t *data, size_t len)
 {
@@ -106,7 +124,7 @@ static int icm_read_ireg(const struct i2c_dt_spec *bus,
 	if (ret) { return ret; }
 
 	for (size_t i = 0; i < len; i++) {
-		k_usleep(4);  /* min gap between IREG reads (datasheet §5.2) */
+		k_usleep(4);
 		ret = icm_read(bus, ICM45686_IREG_DATA, &data[i]);
 		if (ret) { return ret; }
 	}
@@ -117,9 +135,15 @@ static int icm_read_ireg(const struct i2c_dt_spec *bus,
 /*  FIFO helpers                                                       */
 /* ------------------------------------------------------------------ */
 
-/** Read FIFO byte count.  Per reference driver, read twice and use
- *  the second result for reliability.  In stream mode the count is
- *  one behind the written pointer — subtract 1 to avoid hanging byte.
+/**
+ * @brief 读取 FIFO 字节计数。
+ *
+ * 参考驱动双读法：读两次，取第二次结果。stream 模式下 FIFO 写入指针
+ * 滞后 1 字节，返回值减去 1。
+ *
+ * @param[out] count FIFO 中有效字节数
+ * @retval 0 成功
+ * @retval 负值 I²C 错误
  */
 static int read_fifo_count(const struct i2c_dt_spec *bus, uint16_t *count)
 {
@@ -134,7 +158,7 @@ static int read_fifo_count(const struct i2c_dt_spec *bus, uint16_t *count)
 	return 0;
 }
 
-/** Flush FIFO by toggling the flush bit in FIFO_CONFIG2. */
+/** @brief 通过翻转 FIFO_CONFIG2 bit7 清空 FIFO。 */
 static int flush_fifo(const struct i2c_dt_spec *bus)
 {
 	uint8_t val;
@@ -145,18 +169,23 @@ static int flush_fifo(const struct i2c_dt_spec *bus)
 }
 
 /**
- * Parse one 20-byte FIFO packet into accel (m/s²) and gyro (rad/s).
+ * @brief 解析一包 20-byte FIFO 数据（20-bit hires 模式）。
  *
- * Packet layout (little-endian, 20-bit hires mode):
- *   [0]       : Header (expected: 0x78)
- *   [1 — 6]   : Accel  X / Y / Z  (16-bit MSB, LE)
- *   [7 — 12]  : Gyro   X / Y / Z  (16-bit MSB, LE)
- *   [13 — 14] : Temperature       (16-bit, LE)
- *   [15 — 16] : Timestamp         (16-bit, LE, 1 µs)
- *   [17 — 19] : Extension         (upper nibble = accel LSB per axis,
- *                                   lower nibble = gyro  LSB per axis)
+ * 包格式（LE）：
+ *   [0]         Header（期望 0x78）
+ *   [1 — 6]     Accel X/Y/Z  MSB (16-bit)
+ *   [7 — 12]    Gyro  X/Y/Z  MSB (16-bit)
+ *   [13 — 14]   温度 (16-bit)
+ *   [15 — 16]   时间戳 (16-bit, 1µs)
+ *   [17 — 19]   扩展：高 nibble = accel LSB，低 nibble = gyro LSB
  *
- * Returns 0 on success, -1 if the header is invalid.
+ * 20-bit 有符号 → 32G/4000dps 物理值。
+ *
+ * @param[in]  data  20-byte 原始包
+ * @param[out] accel 加速度 (m/s²)
+ * @param[out] gyro  角速度 (rad/s)
+ * @retval 0  成功
+ * @retval -1 header 无效
  */
 static int parse_fifo_packet(const uint8_t *data, float accel[3], float gyro[3])
 {
@@ -165,83 +194,67 @@ static int parse_fifo_packet(const uint8_t *data, float accel[3], float gyro[3])
 	}
 
 	for (int i = 0; i < 3; i++) {
-		/* 16-bit MSBs */
 		int16_t a_hi = sys_get_le16(data + 1 + i * 2);
 		int16_t g_hi = sys_get_le16(data + 7 + i * 2);
-
-		/* Extension byte: upper nibble = accel LSB, lower = gyro LSB */
 		uint8_t ext = data[17 + i];
 
-		/* Assemble 20-bit signed value */
 		int32_t a_20 = ((int32_t)a_hi << 4) | ((ext >> 4) & 0x0F);
 		int32_t g_20 = ((int32_t)g_hi << 4) | (ext & 0x0F);
 
-		/* Sign-extend 20-bit → 32-bit */
+		/* 符号扩展 20-bit → 32-bit */
 		if (a_20 & 0x80000) { a_20 |= 0xFFF00000UL; }
 		if (g_20 & 0x80000) { g_20 |= 0xFFF00000UL; }
 
-		/* Convert to physical units:
-		 *   accel: raw × (32G / 2^19) × 9.80665  →  m/s²
-		 *   gyro:  raw × (4000dps / 2^19) × π/180 →  rad/s
-		 */
-		accel[i] = (float)a_20 * ICM45686_ACCEL_SENSITIVITY_20BIT * ICM45686_EARTH_GRAVITY;
-		gyro[i]  = (float)g_20 * ICM45686_GYRO_SENSITIVITY_20BIT  * ICM45686_DEG_TO_RAD;
+		accel[i] = (float)a_20 * ICM45686_ACCEL_SENSITIVITY_20BIT
+			   * ICM45686_EARTH_GRAVITY;
+		gyro[i]  = (float)g_20 * ICM45686_GYRO_SENSITIVITY_20BIT
+			   * ICM45686_DEG_TO_RAD;
 	}
 
 	return 0;
 }
 
 /* ------------------------------------------------------------------ */
-/*  Quaternion → Euler angles (roll / pitch / yaw in degrees)          */
+/*  Quaternion → Euler angles                                          */
 /* ------------------------------------------------------------------ */
 
+/**
+ * @brief 四元数 → 欧拉角（roll / pitch / yaw，度）。
+ *
+ * @param[in]  q     单位四元数 (w, x, y, z)
+ * @param[out] euler [roll, pitch, yaw] 度
+ */
 static void quat_to_euler(const float q[4], float euler[3])
 {
 	float w = q[0], x = q[1], y = q[2], z = q[3];
 
-	/* roll  = atan2(2(wx + yz), 1 - 2(x² + y²)) */
 	euler[0] = atan2f(2.0f * (w * x + y * z),
 			  1.0f - 2.0f * (x * x + y * y));
 
-	/* pitch = asin(2(wy - zx)) */
 	float sin_pitch = 2.0f * (w * y - z * x);
 	if (sin_pitch > 1.0f)  { sin_pitch = 1.0f; }
 	if (sin_pitch < -1.0f) { sin_pitch = -1.0f; }
 	euler[1] = asinf(sin_pitch);
 
-	/* yaw   = atan2(2(wz + xy), 1 - 2(y² + z²)) */
 	euler[2] = atan2f(2.0f * (w * z + x * y),
 			  1.0f - 2.0f * (y * y + z * z));
 
-	/* Convert to degrees */
 	euler[0] *= ICM45686_RAD_TO_DEG;
 	euler[1] *= ICM45686_RAD_TO_DEG;
 	euler[2] *= ICM45686_RAD_TO_DEG;
 }
 
 /* ------------------------------------------------------------------ */
-/*  Sensor driver API                                                  */
+/*  Internal: FIFO → VQF pipeline (caller must hold lock)             */
 /* ------------------------------------------------------------------ */
 
-/**
- * @brief Read FIFO, run VQF updates, cache results.
- *
- * Called by the application at ≥ 100 Hz.  Processes all available FIFO
- * packets and updates the VQF filter once per packet.  If no data is
- * available the cached values remain valid.
- */
-static int icm_sample_fetch(const struct device *dev, enum sensor_channel chan)
+/** @brief 读一次 FIFO，喂 VQF，缓存最新的欧拉角 + 去偏置陀螺仪。 */
+static void icm_process_fifo(struct icm_data *data, const struct icm_config *cfg)
 {
-	struct icm_data *data = dev->data;
-	const struct icm_config *cfg = dev->config;
 	uint16_t fifo_count;
-	int ret;
 
-	ARG_UNUSED(chan);
-
-	ret = read_fifo_count(&cfg->bus, &fifo_count);
-	if (ret || fifo_count == 0) {
-		return 0;   /* no new data — cached values still good */
+	if (read_fifo_count(&cfg->bus, &fifo_count) < 0 || fifo_count == 0) {
+		return;
 	}
 
 	size_t bytes = fifo_count * ICM45686_FIFO_PACKET_SIZE;
@@ -250,15 +263,10 @@ static int icm_sample_fetch(const struct device *dev, enum sensor_channel chan)
 		fifo_count = (uint16_t)(bytes / ICM45686_FIFO_PACKET_SIZE);
 	}
 
-	ret = icm_burst_read(&cfg->bus, ICM45686_FIFO_DATA, data->fifo_buf, bytes);
-	if (ret) {
-		LOG_WRN("FIFO read failed: %d", ret);
-		return ret;
+	if (icm_burst_read(&cfg->bus, ICM45686_FIFO_DATA, data->fifo_buf, bytes) < 0) {
+		return;
 	}
 
-	/* Process each packet: parse → VQF gyro update → VQF accel update.
-	 * Cache the last valid raw gyro for debiased output.
-	 */
 	int parsed = 0;
 	float last_gyro[3] = { 0 };
 	for (uint16_t i = 0; i < fifo_count; i++) {
@@ -279,10 +287,9 @@ static int icm_sample_fetch(const struct device *dev, enum sensor_channel chan)
 	}
 
 	if (parsed == 0) {
-		return 0;
+		return;
 	}
 
-	/* Cache latest orientation + debiased gyroscope */
 	float quat[4];
 	getQuat6D(&data->vqf_state, quat);
 	quat_to_euler(quat, data->euler);
@@ -293,21 +300,64 @@ static int icm_sample_fetch(const struct device *dev, enum sensor_channel chan)
 	data->gyro_debiased[0] = last_gyro[0] - bias[0];
 	data->gyro_debiased[1] = last_gyro[1] - bias[1];
 	data->gyro_debiased[2] = last_gyro[2] - bias[2];
+}
+
+/* ------------------------------------------------------------------ */
+/*  Auto-feed timer (100 Hz)                                           */
+/* ------------------------------------------------------------------ */
+
+/** @brief 100Hz work handler — 锁 → 处理 FIFO → 解锁 → 重新调度。 */
+static void icm_feed_handler(struct k_work *work)
+{
+	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+	struct icm_data *data = CONTAINER_OF(dwork, struct icm_data, feed_work);
+	const struct icm_config *cfg = data->dev->config;
+
+	k_mutex_lock(&data->lock, K_FOREVER);
+	icm_process_fifo(data, cfg);
+	k_mutex_unlock(&data->lock);
+
+	k_work_schedule(&data->feed_work, K_MSEC(10));
+}
+
+/* ------------------------------------------------------------------ */
+/*  Zephyr sensor driver API                                           */
+/* ------------------------------------------------------------------ */
+
+static int icm_sample_fetch(const struct device *dev, enum sensor_channel chan)
+{
+	struct icm_data *data = dev->data;
+	const struct icm_config *cfg = dev->config;
+
+	ARG_UNUSED(chan);
+
+	k_mutex_lock(&data->lock, K_FOREVER);
+	icm_process_fifo(data, cfg);
+	k_mutex_unlock(&data->lock);
 
 	return 0;
 }
 
+/**
+ * @brief 返回缓存传感器通道值。
+ *
+ * 支持的通道：
+ *   - SENSOR_CHAN_ROTATION — yaw（度）
+ *   - SENSOR_CHAN_GYRO_X/Y/Z — 去偏置角速度（rad/s）
+ */
 static int icm_channel_get(const struct device *dev,
 			   enum sensor_channel chan,
 			   struct sensor_value *val)
 {
 	struct icm_data *data = dev->data;
 
+	k_mutex_lock(&data->lock, K_FOREVER);
+
 	switch (chan) {
-	case SENSOR_CHAN_ROTATION:     /* yaw (degrees) — most useful for car */
+	case SENSOR_CHAN_ROTATION:
 		sensor_value_from_double(val, (double)data->euler[2]);
 		break;
-	case SENSOR_CHAN_GYRO_X:       /* debiased gyro (rad/s) */
+	case SENSOR_CHAN_GYRO_X:
 		sensor_value_from_double(val, (double)data->gyro_debiased[0]);
 		break;
 	case SENSOR_CHAN_GYRO_Y:
@@ -317,12 +367,15 @@ static int icm_channel_get(const struct device *dev,
 		sensor_value_from_double(val, (double)data->gyro_debiased[2]);
 		break;
 	default:
+		k_mutex_unlock(&data->lock);
 		return -ENOTSUP;
 	}
 
+	k_mutex_unlock(&data->lock);
 	return 0;
 }
 
+/** @brief Zephyr sensor 驱动 API 表 */
 static const struct sensor_driver_api icm_api = {
 	.sample_fetch = icm_sample_fetch,
 	.channel_get  = icm_channel_get,
@@ -332,6 +385,19 @@ static const struct sensor_driver_api icm_api = {
 /*  Initialisation                                                     */
 /* ------------------------------------------------------------------ */
 
+/**
+ * @brief ICM45686 硬件初始化 + VQF 启动。
+ *
+ * 步骤：
+ *   1. I²C 总线检查 + WHO_AM_I 验证（期望 0xE9）
+ *   2. 软复位
+ *   3. 内部上拉配置 + 端序设置
+ *   4. 传感器配置：100 Hz ODR, 32G, 4000 dps, 低噪声
+ *   5. 数字滤波器：AAF only, UI LPF = ODR/4
+ *   6. FIFO 配置：2 KB 深度, timestamp, hi-res + accel + gyro, stream 模式
+ *   7. 等待 FIFO 填充，验证数据流
+ *   8. VQF 初始化（gyrTs = accTs = 0.01, 无磁力计）
+ */
 static int icm_init(const struct device *dev)
 {
 	const struct icm_config *cfg = dev->config;
@@ -339,13 +405,13 @@ static int icm_init(const struct device *dev)
 	uint8_t whoami;
 	int ret;
 
-	/* --- I²C bus check --- */
+	/* I²C bus check */
 	if (!device_is_ready(cfg->bus.bus)) {
 		LOG_ERR("I2C bus not ready");
 		return -ENODEV;
 	}
 
-	/* --- WHO_AM_I --- */
+	/* WHO_AM_I */
 	ret = icm_read(&cfg->bus, ICM45686_WHO_AM_I, &whoami);
 	if (ret) {
 		LOG_ERR("WHO_AM_I read failed: %d", ret);
@@ -357,27 +423,25 @@ static int icm_init(const struct device *dev)
 	}
 	LOG_INF("ICM45686 found at 0x%02X", cfg->bus.addr);
 
-	/* --- Reset --- */
+	/* Reset */
 	ret = icm_write(&cfg->bus, ICM45686_REG_MISC2, 0x02);
 	if (ret) { return ret; }
 	k_sleep(K_MSEC(10));
 
-	/* --- Internal pull-ups (stability) --- */
+	/* Internal pull-ups + little-endian config */
 	ret  = icm_write_ireg(&cfg->bus, ICM45686_IPREG_BAR, ICM45686_IPREG_BAR_REG_58, 0xD9);
 	ret |= icm_write_ireg(&cfg->bus, ICM45686_IPREG_BAR, ICM45686_IPREG_BAR_REG_59, 0xBA);
-	/* FIFO little-endian */
 	ret |= icm_write_ireg(&cfg->bus, ICM45686_IPREG_TOP1, ICM45686_SREG_CTRL, 0x00);
 	if (ret) {
 		LOG_ERR("IREG config failed: %d", ret);
 		return ret;
 	}
 
-	/* --- Sensor ODR + full-scale (100 Hz, 32 G, 4000 dps) --- */
+	/* Sensor ODR + FS (100 Hz, 32G, 4000 dps) */
 	ret  = icm_write(&cfg->bus, ICM45686_ACCEL_CONFIG0,
 			 (ACCEL_UI_FS_SEL_32G << 4) | ACCEL_ODR_100HZ);
 	ret |= icm_write(&cfg->bus, ICM45686_GYRO_CONFIG0,
 			 (GYRO_UI_FS_SEL_4000DPS << 4) | GYRO_ODR_100HZ);
-	/* Power on (low-noise) */
 	ret |= icm_write(&cfg->bus, ICM45686_PWR_MGMT0,
 			 (GYRO_MODE_LN << 2) | ACCEL_MODE_LN);
 	k_usleep(250);
@@ -386,7 +450,7 @@ static int icm_init(const struct device *dev)
 		return ret;
 	}
 
-	/* --- Digital filter chain (AAF only; UI LPF @ ODR/4) --- */
+	/* Digital filter chain (AAF only; UI LPF @ ODR/4) */
 	{
 		uint8_t reg;
 		ret  = icm_read_ireg(&cfg->bus, ICM45686_IPREG_SYS1,
@@ -401,7 +465,6 @@ static int icm_init(const struct device *dev)
 		ret |= icm_write_ireg(&cfg->bus, ICM45686_IPREG_SYS2,
 				      ICM45686_IPREG_SYS2_REG_123, reg);
 
-		/* UI LPF */
 		ret |= icm_read_ireg(&cfg->bus, ICM45686_IPREG_SYS1,
 				     ICM45686_IPREG_SYS1_REG_172, &reg, 1);
 		reg = (reg & ~0x07) | UI_LPFBW_ODR_DIV4;
@@ -419,7 +482,7 @@ static int icm_init(const struct device *dev)
 		return ret;
 	}
 
-	/* --- FIFO configuration --- */
+	/* FIFO configuration */
 	{
 		uint8_t fifo_cfg[6];
 		uint8_t smc_ctrl;
@@ -429,33 +492,32 @@ static int icm_init(const struct device *dev)
 				     ICM45686_SMC_CONTROL_0, &smc_ctrl, 1);
 		if (ret) { return ret; }
 
-		/* Stop FIFO, set bypass mode */
-		fifo_cfg[4] &= 0xF0;                    /* FIFO_CONFIG3: disable */
+		/* Stop FIFO → bypass mode */
+		fifo_cfg[4] &= 0xF0;
 		ret |= icm_write(&cfg->bus, ICM45686_FIFO_CONFIG3, fifo_cfg[4]);
-		fifo_cfg[0] &= 0x3F;                    /* FIFO_CONFIG0: bypass */
+		fifo_cfg[0] &= 0x3F;
 		ret |= icm_write(&cfg->bus, ICM45686_FIFO_CONFIG0, fifo_cfg[0]);
 
-		/* Timestamp enable */
 		smc_ctrl |= BIT(0);
 		ret |= icm_write_ireg(&cfg->bus, ICM45686_IPREG_TOP1,
 				      ICM45686_SMC_CONTROL_0, smc_ctrl);
-		fifo_cfg[5] |= BIT(1);                   /* FIFO_TMST_FSYNC_EN */
+		fifo_cfg[5] |= BIT(1);
 
-		/* FIFO depth: 2 KB */
+		/* 2 KB depth */
 		fifo_cfg[0] = (fifo_cfg[0] & 0xC0) | 0x07;
 
-		/* Watermark (not used for polling, but set for safety) */
-		fifo_cfg[1] = 0x40;                      /* 64 bytes (LSB) */
-		fifo_cfg[2] = 0x00;                      /* (MSB) */
+		/* watermark 64 bytes */
+		fifo_cfg[1] = 0x40;
+		fifo_cfg[2] = 0x00;
 
-		/* HIRES + accel + gyro enabled */
+		/* hires + accel + gyro */
 		fifo_cfg[4] |= 0x0E;
 
-		/* Write back, then switch to stream mode */
+		/* Write back, switch to stream mode */
 		ret |= icm_burst_write(&cfg->bus, ICM45686_FIFO_CONFIG0, fifo_cfg, 6);
-		fifo_cfg[0] |= 0x40;                     /* stream-to-FIFO */
+		fifo_cfg[0] |= 0x40;
 		ret |= icm_write(&cfg->bus, ICM45686_FIFO_CONFIG0, fifo_cfg[0]);
-		fifo_cfg[4] |= BIT(0);                   /* FIFO_CONFIG3: enable */
+		fifo_cfg[4] |= BIT(0);
 		ret |= icm_write(&cfg->bus, ICM45686_FIFO_CONFIG3, fifo_cfg[4]);
 	}
 	if (ret) {
@@ -463,7 +525,7 @@ static int icm_init(const struct device *dev)
 		return ret;
 	}
 
-	/* --- Wait for FIFO to fill --- */
+	/* Wait for FIFO to fill */
 	{
 		uint16_t check = 0;
 		k_sleep(K_MSEC(15));
@@ -475,11 +537,17 @@ static int icm_init(const struct device *dev)
 		}
 	}
 
-	/* --- VQF initialisation (100 Hz: gyrTs = accTs = 0.01, no mag) --- */
+	/* VQF init (100 Hz, no mag) */
 	init_params(&data->vqf_params);
 	initVqf(&data->vqf_params, &data->vqf_state, &data->vqf_coeffs,
 		0.01f, 0.01f, -1.0f);
 	data->vqf_ready = true;
+
+	/* start 100Hz auto-feed timer */
+	data->dev = dev;
+	k_mutex_init(&data->lock);
+	k_work_init_delayable(&data->feed_work, icm_feed_handler);
+	k_work_schedule(&data->feed_work, K_MSEC(10));
 
 	LOG_INF("ICM45686 + VQF ready (100 Hz, internal RC osc)");
 	return 0;
@@ -489,6 +557,7 @@ static int icm_init(const struct device *dev)
 /*  Driver instantiation macro                                         */
 /* ------------------------------------------------------------------ */
 
+/** @brief 设备注册宏 */
 #define ICM45686_INIT(n)                                                       \
 	static struct icm_data icm_data_##n = {                                \
 		.vqf_ready = false,                                            \
