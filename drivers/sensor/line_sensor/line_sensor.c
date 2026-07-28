@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * @file line_sensor.c
- * @brief 8-channel grayscale line sensor via 4051 analog mux + ADC.
+ * @brief 8-channel grayscale line sensor via 4051 analog mux + ADC
+ *        with junction/lost event detection.
  */
 
 #define DT_DRV_COMPAT long_line_sensor
@@ -22,6 +23,14 @@
 #include <string.h>
 
 LOG_MODULE_REGISTER(line_sensor, CONFIG_SENSOR_LOG_LEVEL);
+
+/* ---------- event detection thresholds ---------- */
+
+/** @brief norm < this → "dark" (line) for event detection */
+#define EVENT_DARK_THRESH 500
+
+/** @brief min dark channels in center group (2-5) to consider "line present" */
+#define EVENT_CENTER_MIN  1
 
 /* ---------- config / data ---------- */
 
@@ -53,8 +62,14 @@ struct line_sensor_data {
 	float normal_factor[LINE_SENSOR_MAX_CHANNELS];
 	/** Digital (binary) output bitmap */
 	atomic_t digital;
-	/** Whether calibration has been performed */
+	/** White calibration done */
+	bool white_calibrated;
+	/** Black calibration done */
+	bool black_calibrated;
+	/** Fully calibrated (white && black) */
 	bool calibrated;
+	/** Previous event for edge detection (LOST→FOUND) */
+	line_event_t prev_event;
 	/** Lock for concurrent access */
 	struct k_mutex lock;
 };
@@ -83,8 +98,8 @@ static int cmp_u16(const void *a, const void *b)
  *
  * @param dev      line-sensor device
  * @param ch       channel index (0..num_sensors-1)
- * @param n_sample number of samples (must be odd, ≤16)
- * @return median ADC reading, or 0 on error
+ * @param n_sample number of samples (1..32; for ≥5 the min/max are dropped)
+ * @return averaged ADC reading, or 0 on error / invalid n_sample
  */
 static uint16_t read_channel(const struct device *dev, uint8_t ch, int n_sample)
 {
@@ -93,14 +108,18 @@ static uint16_t read_channel(const struct device *dev, uint8_t ch, int n_sample)
 	int16_t val;
 	int err;
 
+	if (n_sample < 1 || n_sample > (int)(sizeof(buf) / sizeof(buf[0]))) {
+		return 0;
+	}
+
 	mux_select(cfg, ch);
-	k_busy_wait(10); /* MUX settling time */
+	k_busy_wait(50); /* 4051 MUX settling — 3.3V 下留足余量 */
 
 	for (int i = 0; i < n_sample; i++) {
 		struct adc_sequence seq = {
 			.buffer      = &val,
 			.buffer_size = sizeof(val),
-			.resolution  = cfg->adc.resolution,
+			.resolution  = 12,
 			.channels    = BIT(cfg->adc.channel_id),
 			.oversampling = 0,
 		};
@@ -218,6 +237,60 @@ static void compute_normalized(const struct line_sensor_data *data, uint16_t *no
 	}
 }
 
+/* ---------- event detection ---------- */
+
+/**
+ * @brief 基于归一化数据分析巡线事件。
+ *
+ * 8 通道分区：
+ *   - 左边缘 (0–1)      : 左路口判别
+ *   - 中央区 (2–5)      : 主线判别
+ *   - 右边缘 (6–7)      : 右路口判别
+ *
+ * 事件判定优先级（从高到低）：
+ *   CROSS > LEFT/RIGHT > LOST > FOUND > NONE
+ */
+static line_event_t detect_event(const struct line_sensor_data *data)
+{
+	int dark_center = 0, dark_left = 0, dark_right = 0, dark_total = 0;
+
+	for (int i = 0; i < LINE_SENSOR_MAX_CHANNELS; i++) {
+		if (data->norm[i] < EVENT_DARK_THRESH) {
+			dark_total++;
+			if (i <= 1)       { dark_left++;   }
+			else if (i <= 5)  { dark_center++;  }
+			else              { dark_right++;   }
+		}
+	}
+
+	/* 线完全消失 */
+	if (dark_total == 0) {
+		return LINE_EVT_LOST;
+	}
+
+	/* 中央无线 → 线偏到边缘了，不是路口，算正常（丢线情况由上层处理） */
+	if (dark_center < EVENT_CENTER_MIN) {
+		return LINE_EVT_NONE;
+	}
+
+	/* 十字/T 路口：左右边缘同时有暗区 */
+	if (dark_left >= 1 && dark_right >= 1) {
+		return LINE_EVT_CROSS;
+	}
+
+	/* 左路口 */
+	if (dark_left >= 1 && dark_right == 0) {
+		return LINE_EVT_LEFT;
+	}
+
+	/* 右路口 */
+	if (dark_right >= 1 && dark_left == 0) {
+		return LINE_EVT_RIGHT;
+	}
+
+	return LINE_EVT_NONE;
+}
+
 /* ========== Zephyr sensor API ========== */
 
 static int line_sensor_sample_fetch(const struct device *dev, enum sensor_channel chan)
@@ -285,7 +358,8 @@ int line_sensor_calibrate_white(const struct device *dev)
 	}
 
 	recompute_calibration(data);
-	data->calibrated = true;
+	data->white_calibrated = true;
+	data->calibrated = data->white_calibrated && data->black_calibrated;
 
 	k_mutex_unlock(&data->lock);
 
@@ -311,7 +385,8 @@ int line_sensor_calibrate_black(const struct device *dev)
 	}
 
 	recompute_calibration(data);
-	data->calibrated = true;
+	data->black_calibrated = true;
+	data->calibrated = data->white_calibrated && data->black_calibrated;
 
 	k_mutex_unlock(&data->lock);
 
@@ -366,9 +441,32 @@ void line_sensor_reset_calibration(const struct device *dev)
 	for (int i = 0; i < LINE_SENSOR_MAX_CHANNELS; i++) {
 		data->normal_factor[i] = 1.0f;
 	}
+	data->white_calibrated = false;
+	data->black_calibrated = false;
 	data->calibrated = false;
+	data->prev_event = LINE_EVT_NONE;
 	atomic_set(&data->digital, 0);
 	k_mutex_unlock(&data->lock);
+}
+
+line_event_t line_sensor_get_event(const struct device *dev)
+{
+	struct line_sensor_data *data = dev->data;
+	line_event_t evt;
+
+	k_mutex_lock(&data->lock, K_FOREVER);
+
+	evt = detect_event(data);
+
+	/* LOST → 有线 = FOUND（上升沿检测） */
+	if (data->prev_event == LINE_EVT_LOST && evt != LINE_EVT_LOST) {
+		evt = LINE_EVT_FOUND;
+	}
+	data->prev_event = evt;
+
+	k_mutex_unlock(&data->lock);
+
+	return evt;
 }
 
 /* ========== Zephyr device init ========== */
@@ -383,6 +481,38 @@ static int line_sensor_init(const struct device *dev)
 	if (!device_is_ready(cfg->adc.dev)) {
 		LOG_ERR("ADC not ready");
 		return -ENODEV;
+	}
+
+	/* MSPM0 ADC requires adc_channel_setup before adc_read */
+	{
+		struct adc_channel_cfg ch_cfg = {
+			.gain             = ADC_GAIN_1,
+			.reference        = ADC_REF_VDD_1,
+			.acquisition_time = ADC_ACQ_TIME_DEFAULT,
+			.channel_id       = cfg->adc.channel_id,
+			.differential     = 0,
+		};
+		int ch_ret = adc_channel_setup(cfg->adc.dev, &ch_cfg);
+		if (ch_ret < 0) {
+			LOG_ERR("adc channel setup ch=%d failed: %d",
+				cfg->adc.channel_id, ch_ret);
+			return ch_ret;
+		}
+	}
+
+	/* diagnostic: read ADC directly once, no MUX */
+	{
+		int16_t test_val = -1;
+		struct adc_sequence test_seq = {
+			.buffer      = &test_val,
+			.buffer_size = sizeof(test_val),
+			.resolution  = 12,
+			.channels    = BIT(cfg->adc.channel_id),
+			.oversampling = 0,
+		};
+		int test_ret = adc_read(cfg->adc.dev, &test_seq);
+		LOG_INF("ADC diag: ret=%d val=%d ch=%d",
+			test_ret, (int)test_val, cfg->adc.channel_id);
 	}
 
 	/* Verify and configure mux GPIOs */

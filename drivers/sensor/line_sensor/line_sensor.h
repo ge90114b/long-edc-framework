@@ -19,6 +19,16 @@ extern "C" {
 /** @brief Maximum number of sensor channels. */
 #define LINE_SENSOR_MAX_CHANNELS 8
 
+/** @brief 巡线事件类型 */
+typedef enum {
+	LINE_EVT_NONE  = 0, /**< 正常巡线，线在中间 */
+	LINE_EVT_LOST  = 1, /**< 线消失（全部通道看到白） */
+	LINE_EVT_FOUND = 2, /**< 线出现（从 LOST 恢复） */
+	LINE_EVT_LEFT  = 3, /**< 左路口（左侧出现暗区分支） */
+	LINE_EVT_RIGHT = 4, /**< 右路口（右侧出现暗区分支） */
+	LINE_EVT_CROSS = 5, /**< 十字/T 路口（左右两侧同时出现暗区） */
+} line_event_t;
+
 /**
  * @brief 读取 8 通道原始 ADC 值（均值滤波后）。
  *
@@ -97,6 +107,17 @@ bool line_sensor_is_calibrated(const struct device *dev);
  * @param dev  line-sensor 设备
  */
 void line_sensor_reset_calibration(const struct device *dev);
+
+/**
+ * @brief 检测巡线事件（路口、线消失等）。
+ *
+ * 基于最后一次 sample_fetch 得到的归一化数据，
+ * 按 8 通道暗区分布判断事件类型。
+ *
+ * @param dev  line-sensor 设备
+ * @return 当前事件类型
+ */
+line_event_t line_sensor_get_event(const struct device *dev);
 
 #ifdef __cplusplus
 }

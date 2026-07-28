@@ -8,3 +8,18 @@ config LONG_QDEC
 	  Quadrature decoder sensor using one GPIO interrupt pin (channel A)
 	  and one GPIO input pin (channel B). Decodes at 2x resolution by
 	  reading channel B on each edge of channel A.
+
+config LONG_QDEC_AVG_TAP
+	int "Number of edges averaged for RPM (sliding window)"
+	default 8
+	range 1 32
+	depends on LONG_QDEC
+	help
+	  Sliding-window size N for period-method RPM. Each ISR pushes the
+	  latest edge interval into an N-deep ring; RPM is computed from the
+	  N-edge average, damping per-edge ISR jitter by ~N. Larger N = smoother
+	  RPM but more lag at low speed (window spans N edges). At 11ppr 4x
+	  there are 44 edges/rev, so N=8 spans ~0.18 rev. N=1 reproduces the
+	  single-point T-method. Every valid edge is pushed regardless of
+	  interval (idle is judged in fetch, not ISR) so low speed / restart
+	  never starves the window.

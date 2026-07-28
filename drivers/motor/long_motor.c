@@ -34,7 +34,7 @@ struct motor_config {
 
 /** @brief RAM — 闭环运行时状态 */
 struct motor_data {
-	struct motor_pid_config pid;
+	const struct motor_pid_config *pid_cfg;  /* ptr to app's live pid_cfg — Ozone tuneable */
 
 	float target_speed;       /**< 目标轮子 RPM（带符号） */
 	float current_speed;      /**< 缓存：最近一次 PID 周期测得的轮子 RPM */
@@ -50,6 +50,26 @@ struct motor_data {
 	struct k_mutex            lock;        /**< 保护 data 的互斥锁 */
 	struct k_work_delayable   pid_work;    /**< PID 周期调度工作项 */
 };
+
+/* ---------- PWM 输出辅助 ---------- */
+
+/**
+ * @brief 写电机 PWM 占空比，pulse ∈ [0, period] 对应 0%..100%。
+ *
+ * MSPM0 GPTimer 在 EDGE_ALIGN 模式下，driverlib 把 CC 输出动作配成
+ * LACT=高 / CDACT=低（见 dl_timer.c 的 DL_Timer_initTwoCCPWMMode），
+ * 也就是 CC 比较值越小、占空比越大，CC=0 时输出恒高（=100%）。
+ * 若把 pulse 原样透传给 pwm_set_pulse_dt，pulse=0 反而是全速运转
+ * （这正是“一上电轮子就自己转”的根因）。这里翻转 pulse，使外部语义
+ * 符合直觉：pulse=0 → 0% 占空比（停车），pulse=period → 100%。
+ */
+static void motor_pwm_write(const struct motor_config *cfg, uint32_t pulse)
+{
+	if (pulse > cfg->pwm.period) {
+		pulse = cfg->pwm.period;
+	}
+	pwm_set_pulse_dt(&cfg->pwm, cfg->pwm.period - pulse);
+}
 
 /* ---------- PID work handler ---------- */
 
@@ -76,23 +96,18 @@ static void motor_pid_tick(struct k_work *work)
 
 	if (!data->initialized) {
 		k_mutex_unlock(&data->lock);
-		k_work_schedule(&data->pid_work, K_MSEC(data->pid.period_ms));
+		k_work_schedule(&data->pid_work, K_MSEC(data->pid_cfg->period_ms));
 		return;
 	}
 
-	/* 目标转速为 0：停车（PWM 关断）*/
-	if (data->target_speed == 0.0f) {
-		pwm_set_pulse_dt(&cfg->pwm, 0);
-		k_mutex_unlock(&data->lock);
-		k_work_schedule(&data->pid_work, K_MSEC(data->pid.period_ms));
-		return;
-	}
+	/* 目标转速 0 也走完整 PID（error = -feedback，PID 输出被下限 clamp 到 0%），
+	 * 全程闭环，无开环关断特判。 */
 
 	/* 1. 读取 QDEC */
 	if (sensor_sample_fetch(cfg->qdec) < 0) {
 		LOG_WRN("qdec fetch failed");
 		k_mutex_unlock(&data->lock);
-		k_work_schedule(&data->pid_work, K_MSEC(data->pid.period_ms));
+		k_work_schedule(&data->pid_work, K_MSEC(data->pid_cfg->period_ms));
 		return;
 	}
 
@@ -109,35 +124,34 @@ static void motor_pid_tick(struct k_work *work)
 	/* 3. PID（绝对转速控制） */
 	feedback = fabsf(data->current_speed);
 	error    = fabsf(data->target_speed) - feedback;
-	dt       = data->pid.period_ms / 1000.0f;
+	dt       = data->pid_cfg->period_ms / 1000.0f;
 
-	p = data->pid.kp * error;
+	p = data->pid_cfg->kp * error;
 
-	data->pid_integral += data->pid.ki * error * dt;
-	if (data->pid_integral > data->pid.integral_max) {
-		data->pid_integral = data->pid.integral_max;
-	} else if (data->pid_integral < -data->pid.integral_max) {
-		data->pid_integral = -data->pid.integral_max;
+	data->pid_integral += data->pid_cfg->ki * error * dt;
+	if (data->pid_integral > data->pid_cfg->integral_max) {
+		data->pid_integral = data->pid_cfg->integral_max;
+	} else if (data->pid_integral < -data->pid_cfg->integral_max) {
+		data->pid_integral = -data->pid_cfg->integral_max;
 	}
 	i = data->pid_integral;
 
-	d = data->pid.kd * (error - data->pid_prev_error) / dt;
+	d = data->pid_cfg->kd * (error - data->pid_prev_error) / dt;
 	data->pid_prev_error = error;
 
 	out = p + i + d;
-	if (out > data->pid.output_max) {
-		out = data->pid.output_max;
+	if (out > data->pid_cfg->output_max) {
+		out = data->pid_cfg->output_max;
 	} else if (out < 0.0f) {
 		out = 0.0f;
 	}
 
 	/* 4. 方向 + PWM 输出 */
 	gpio_pin_set_dt(&cfg->dir, data->target_speed >= 0.0f ? 1 : 0);
-	pwm_set_pulse_dt(&cfg->pwm,
-		(uint32_t)(cfg->pwm.period * out / 100.0f));
+	motor_pwm_write(cfg, (uint32_t)(cfg->pwm.period * out / 100.0f));
 
 	k_mutex_unlock(&data->lock);
-	k_work_schedule(&data->pid_work, K_MSEC(data->pid.period_ms));
+	k_work_schedule(&data->pid_work, K_MSEC(data->pid_cfg->period_ms));
 }
 
 /* ========== Public API ========== */
@@ -154,14 +168,14 @@ int motor_init(const struct device *dev, const struct motor_pid_config *cfg)
 
 	if (data->initialized) {
 		/* 允许运行时重新调参 */
-		data->pid = *cfg;
+		data->pid_cfg = cfg;
 		data->pid_integral = 0.0f;
 		data->pid_prev_error = 0.0f;
 		k_mutex_unlock(&data->lock);
 		return 0;
 	}
 
-	data->pid         = *cfg;
+	data->pid_cfg = cfg;
 	data->initialized = true;
 
 	motor_reset_distance(dev);
@@ -245,14 +259,14 @@ void motor_reset_distance(const struct device *dev)
 int motor_stop(const struct device *dev)
 {
 	struct motor_data *data = dev->data;
-	const struct motor_config *cfg = dev->config;
 
 	k_mutex_lock(&data->lock, K_FOREVER);
 
+	/* 全程 PID：stop 仅把目标设为 0，由 PID 周期闭环制动到 0，不做开环关断。
+	 * 复位积分/微分状态，避免残留影响下次启动。 */
 	data->target_speed = 0.0f;
 	data->pid_integral = 0.0f;
 	data->pid_prev_error = 0.0f;
-	pwm_set_pulse_dt(&cfg->pwm, 0);
 
 	k_mutex_unlock(&data->lock);
 
@@ -289,7 +303,7 @@ static int motor_device_init(const struct device *dev)
 
 	gpio_pin_configure_dt(&cfg->dir, GPIO_OUTPUT_INACTIVE);
 	gpio_pin_set_dt(&cfg->dir, 1);          /* 默认正向 */
-	pwm_set_pulse_dt(&cfg->pwm, 0);         /* PWM 关断 */
+	motor_pwm_write(cfg, 0);                /* 0% 占空比（停车）*/
 
 	data->dev = dev;
 

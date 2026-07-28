@@ -28,3 +28,11 @@ properties:
     description: |
       Number of pulses (full quadrature cycles) per revolution.
       Set to 0 to get raw step counts.
+
+  output-reversed:
+    type: boolean
+    description: |
+      反转编码器输出方向。当编码器物理转向与系统期望的正方向相反时置位
+      （例如电机正转时编码器读数为负）。在 ISR 源头取反 delta，
+      ROTATION/RPM 符号随之反转，所有消费者（motor PID、距离累积等）
+      无需各自处理方向。

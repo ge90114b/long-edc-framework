@@ -47,6 +47,8 @@ struct icm_data {
 	vqf_coeffs_t  vqf_coeffs;     /**< VQF 预计算系数 */
 	bool          vqf_ready;      /**< VQF 初始化完成 */
 
+	struct i2c_dt_spec bus;       /**< 运行期总线 spec（地址自动探测后填入） */
+
 	float euler[3];               /**< 缓存：roll, pitch, yaw (度) */
 	float gyro_debiased[3];       /**< 缓存：去偏置角速度 (rad/s) */
 
@@ -136,12 +138,12 @@ static int icm_read_ireg(const struct i2c_dt_spec *bus,
 /* ------------------------------------------------------------------ */
 
 /**
- * @brief 读取 FIFO 字节计数。
+ * @brief 读取 FIFO 数据帧计数。
  *
  * 参考驱动双读法：读两次，取第二次结果。stream 模式下 FIFO 写入指针
- * 滞后 1 字节，返回值减去 1。
+ * 滞后一帧，返回值减去 1（与验证过的参考驱动一致）。
  *
- * @param[out] count FIFO 中有效字节数
+ * @param[out] count FIFO 中可读数据帧数（每帧 = ICM45686_FIFO_PACKET_SIZE 字节）
  * @retval 0 成功
  * @retval 负值 I²C 错误
  */
@@ -249,11 +251,11 @@ static void quat_to_euler(const float q[4], float euler[3])
 /* ------------------------------------------------------------------ */
 
 /** @brief 读一次 FIFO，喂 VQF，缓存最新的欧拉角 + 去偏置陀螺仪。 */
-static void icm_process_fifo(struct icm_data *data, const struct icm_config *cfg)
+static void icm_process_fifo(struct icm_data *data)
 {
 	uint16_t fifo_count;
 
-	if (read_fifo_count(&cfg->bus, &fifo_count) < 0 || fifo_count == 0) {
+	if (read_fifo_count(&data->bus, &fifo_count) < 0 || fifo_count == 0) {
 		return;
 	}
 
@@ -263,7 +265,7 @@ static void icm_process_fifo(struct icm_data *data, const struct icm_config *cfg
 		fifo_count = (uint16_t)(bytes / ICM45686_FIFO_PACKET_SIZE);
 	}
 
-	if (icm_burst_read(&cfg->bus, ICM45686_FIFO_DATA, data->fifo_buf, bytes) < 0) {
+	if (icm_burst_read(&data->bus, ICM45686_FIFO_DATA, data->fifo_buf, bytes) < 0) {
 		return;
 	}
 
@@ -311,10 +313,9 @@ static void icm_feed_handler(struct k_work *work)
 {
 	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
 	struct icm_data *data = CONTAINER_OF(dwork, struct icm_data, feed_work);
-	const struct icm_config *cfg = data->dev->config;
 
 	k_mutex_lock(&data->lock, K_FOREVER);
-	icm_process_fifo(data, cfg);
+	icm_process_fifo(data);
 	k_mutex_unlock(&data->lock);
 
 	k_work_schedule(&data->feed_work, K_MSEC(10));
@@ -327,12 +328,11 @@ static void icm_feed_handler(struct k_work *work)
 static int icm_sample_fetch(const struct device *dev, enum sensor_channel chan)
 {
 	struct icm_data *data = dev->data;
-	const struct icm_config *cfg = dev->config;
 
 	ARG_UNUSED(chan);
 
 	k_mutex_lock(&data->lock, K_FOREVER);
-	icm_process_fifo(data, cfg);
+	icm_process_fifo(data);
 	k_mutex_unlock(&data->lock);
 
 	return 0;
@@ -382,6 +382,36 @@ static const struct sensor_driver_api icm_api = {
 };
 
 /* ------------------------------------------------------------------ */
+/*  Address auto-detection (AD0 unreliable → probe 0x68/0x69)          */
+/* ------------------------------------------------------------------ */
+
+/* AD0 can leave the IMU at 0x68 or 0x69 depending on module wiring, so probe
+ * both and adopt whichever answers with WHO_AM_I = 0xE9. Retries ride out the
+ * power-on bus flakiness seen on this board. */
+static int icm_detect_addr(const struct device *ctrl, uint16_t *out_addr)
+{
+	static const uint16_t addrs[] = { 0x68, 0x69 };
+
+	for (int i = 0; i < ARRAY_SIZE(addrs); i++) {
+		struct i2c_dt_spec spec = { .bus = ctrl, .addr = addrs[i] };
+
+		for (int attempt = 0; attempt < 5; attempt++) {
+			uint8_t who = 0;
+
+			if (icm_read(&spec, ICM45686_WHO_AM_I, &who) == 0) {
+				if (who == 0xE9) {
+					*out_addr = addrs[i];
+					return 0;
+				}
+				break;	/* answers, but wrong device — stop retrying */
+			}
+			k_msleep(5);
+		}
+	}
+	return -ENODEV;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Initialisation                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -402,7 +432,6 @@ static int icm_init(const struct device *dev)
 {
 	const struct icm_config *cfg = dev->config;
 	struct icm_data *data = dev->data;
-	uint8_t whoami;
 	int ret;
 
 	/* I²C bus check */
@@ -411,38 +440,60 @@ static int icm_init(const struct device *dev)
 		return -ENODEV;
 	}
 
-	/* WHO_AM_I */
-	ret = icm_read(&cfg->bus, ICM45686_WHO_AM_I, &whoami);
-	if (ret) {
-		LOG_ERR("WHO_AM_I read failed: %d", ret);
-		return -EIO;
-	}
-	if (whoami != 0xE9) {
-		LOG_ERR("Unexpected WHO_AM_I: 0x%02X (expected 0xE9)", whoami);
-		return -ENODEV;
-	}
-	LOG_INF("ICM45686 found at 0x%02X", cfg->bus.addr);
+	/* Let the IMU finish power-on boot and settle its I2C address (AD0).
+	 * We run at POST_KERNEL within ~10 ms of power-on; in that window the
+	 * device's address is unstable and it can ACK the wrong address or NACK,
+	 * making WHO_AM_I / register reads fail with -EIO. */
+	k_sleep(K_MSEC(50));
 
-	/* Reset */
-	ret = icm_write(&cfg->bus, ICM45686_REG_MISC2, 0x02);
+	/* Auto-detect address (0x68 or 0x69). AD0 is unreliable on this board, so
+	 * probe both and keep whichever answers with a valid WHO_AM_I. */
+	uint16_t addr;
+	ret = icm_detect_addr(cfg->bus.bus, &addr);
+	if (ret) {
+		LOG_ERR("ICM45686 not found at 0x68/0x69 (WHO_AM_I failed)");
+		return ret;
+	}
+	data->bus.bus = cfg->bus.bus;
+	data->bus.addr = addr;
+	LOG_INF("ICM45686 found at 0x%02X", addr);
+
+	/* Soft reset DISABLED for bring-up: resetting re-samples the floating AD0
+	 * pin and flips the I²C address, breaking every transaction after it. The
+	 * device is already in its power-on default state, so configure it directly.
+	 * Re-enable this block (and tie AD0 in hardware) once the pin is fixed. */
+#if 0
+	ret = icm_write(&data->bus, ICM45686_REG_MISC2, 0x02);
 	if (ret) { return ret; }
-	k_sleep(K_MSEC(10));
+	k_sleep(K_MSEC(50));
+
+	ret = icm_detect_addr(cfg->bus.bus, &addr);
+	if (ret) {
+		LOG_ERR("ICM45686 not responding after reset");
+		return ret;
+	}
+	if (addr != data->bus.addr) {
+		LOG_INF("address flipped after reset: 0x%02X -> 0x%02X",
+			data->bus.addr, addr);
+		data->bus.addr = addr;
+	}
+#endif
 
 	/* Internal pull-ups + little-endian config */
-	ret  = icm_write_ireg(&cfg->bus, ICM45686_IPREG_BAR, ICM45686_IPREG_BAR_REG_58, 0xD9);
-	ret |= icm_write_ireg(&cfg->bus, ICM45686_IPREG_BAR, ICM45686_IPREG_BAR_REG_59, 0xBA);
-	ret |= icm_write_ireg(&cfg->bus, ICM45686_IPREG_TOP1, ICM45686_SREG_CTRL, 0x00);
+	ret  = icm_write_ireg(&data->bus, ICM45686_IPREG_BAR, ICM45686_IPREG_BAR_REG_58, 0xD9);
+	ret |= icm_write_ireg(&data->bus, ICM45686_IPREG_BAR, ICM45686_IPREG_BAR_REG_59, 0xBA);
+	ret |= icm_write_ireg(&data->bus, ICM45686_IPREG_TOP1, ICM45686_SREG_CTRL, 0x00);
 	if (ret) {
 		LOG_ERR("IREG config failed: %d", ret);
 		return ret;
 	}
 
 	/* Sensor ODR + FS (100 Hz, 32G, 4000 dps) */
-	ret  = icm_write(&cfg->bus, ICM45686_ACCEL_CONFIG0,
+	ret  = icm_write(&data->bus, ICM45686_ACCEL_CONFIG0,
 			 (ACCEL_UI_FS_SEL_32G << 4) | ACCEL_ODR_100HZ);
-	ret |= icm_write(&cfg->bus, ICM45686_GYRO_CONFIG0,
+	ret |= icm_write(&data->bus, ICM45686_GYRO_CONFIG0,
 			 (GYRO_UI_FS_SEL_4000DPS << 4) | GYRO_ODR_100HZ);
-	ret |= icm_write(&cfg->bus, ICM45686_PWR_MGMT0,
+	ret |= icm_write(&data->bus, ICM45686_PWR_MGMT0,
 			 (GYRO_MODE_LN << 2) | ACCEL_MODE_LN);
 	k_usleep(250);
 	if (ret) {
@@ -453,28 +504,28 @@ static int icm_init(const struct device *dev)
 	/* Digital filter chain (AAF only; UI LPF @ ODR/4) */
 	{
 		uint8_t reg;
-		ret  = icm_read_ireg(&cfg->bus, ICM45686_IPREG_SYS1,
+		ret  = icm_read_ireg(&data->bus, ICM45686_IPREG_SYS1,
 				     ICM45686_IPREG_SYS1_REG_166, &reg, 1);
 		reg = (reg & ~(0x03 << 5)) | (SRC_CTRL_AAF_ONLY << 5);
-		ret |= icm_write_ireg(&cfg->bus, ICM45686_IPREG_SYS1,
+		ret |= icm_write_ireg(&data->bus, ICM45686_IPREG_SYS1,
 				      ICM45686_IPREG_SYS1_REG_166, reg);
 
-		ret |= icm_read_ireg(&cfg->bus, ICM45686_IPREG_SYS2,
+		ret |= icm_read_ireg(&data->bus, ICM45686_IPREG_SYS2,
 				     ICM45686_IPREG_SYS2_REG_123, &reg, 1);
 		reg = (reg & ~0x03) | SRC_CTRL_AAF_ONLY;
-		ret |= icm_write_ireg(&cfg->bus, ICM45686_IPREG_SYS2,
+		ret |= icm_write_ireg(&data->bus, ICM45686_IPREG_SYS2,
 				      ICM45686_IPREG_SYS2_REG_123, reg);
 
-		ret |= icm_read_ireg(&cfg->bus, ICM45686_IPREG_SYS1,
+		ret |= icm_read_ireg(&data->bus, ICM45686_IPREG_SYS1,
 				     ICM45686_IPREG_SYS1_REG_172, &reg, 1);
 		reg = (reg & ~0x07) | UI_LPFBW_ODR_DIV4;
-		ret |= icm_write_ireg(&cfg->bus, ICM45686_IPREG_SYS1,
+		ret |= icm_write_ireg(&data->bus, ICM45686_IPREG_SYS1,
 				      ICM45686_IPREG_SYS1_REG_172, reg);
 
-		ret |= icm_read_ireg(&cfg->bus, ICM45686_IPREG_SYS2,
+		ret |= icm_read_ireg(&data->bus, ICM45686_IPREG_SYS2,
 				     ICM45686_IPREG_SYS2_REG_131, &reg, 1);
 		reg = (reg & ~0x07) | UI_LPFBW_ODR_DIV4;
-		ret |= icm_write_ireg(&cfg->bus, ICM45686_IPREG_SYS2,
+		ret |= icm_write_ireg(&data->bus, ICM45686_IPREG_SYS2,
 				      ICM45686_IPREG_SYS2_REG_131, reg);
 	}
 	if (ret) {
@@ -487,19 +538,19 @@ static int icm_init(const struct device *dev)
 		uint8_t fifo_cfg[6];
 		uint8_t smc_ctrl;
 
-		ret  = icm_burst_read(&cfg->bus, ICM45686_FIFO_CONFIG0, fifo_cfg, 6);
-		ret |= icm_read_ireg(&cfg->bus, ICM45686_IPREG_TOP1,
+		ret  = icm_burst_read(&data->bus, ICM45686_FIFO_CONFIG0, fifo_cfg, 6);
+		ret |= icm_read_ireg(&data->bus, ICM45686_IPREG_TOP1,
 				     ICM45686_SMC_CONTROL_0, &smc_ctrl, 1);
 		if (ret) { return ret; }
 
 		/* Stop FIFO → bypass mode */
 		fifo_cfg[4] &= 0xF0;
-		ret |= icm_write(&cfg->bus, ICM45686_FIFO_CONFIG3, fifo_cfg[4]);
+		ret |= icm_write(&data->bus, ICM45686_FIFO_CONFIG3, fifo_cfg[4]);
 		fifo_cfg[0] &= 0x3F;
-		ret |= icm_write(&cfg->bus, ICM45686_FIFO_CONFIG0, fifo_cfg[0]);
+		ret |= icm_write(&data->bus, ICM45686_FIFO_CONFIG0, fifo_cfg[0]);
 
 		smc_ctrl |= BIT(0);
-		ret |= icm_write_ireg(&cfg->bus, ICM45686_IPREG_TOP1,
+		ret |= icm_write_ireg(&data->bus, ICM45686_IPREG_TOP1,
 				      ICM45686_SMC_CONTROL_0, smc_ctrl);
 		fifo_cfg[5] |= BIT(1);
 
@@ -514,11 +565,11 @@ static int icm_init(const struct device *dev)
 		fifo_cfg[4] |= 0x0E;
 
 		/* Write back, switch to stream mode */
-		ret |= icm_burst_write(&cfg->bus, ICM45686_FIFO_CONFIG0, fifo_cfg, 6);
+		ret |= icm_burst_write(&data->bus, ICM45686_FIFO_CONFIG0, fifo_cfg, 6);
 		fifo_cfg[0] |= 0x40;
-		ret |= icm_write(&cfg->bus, ICM45686_FIFO_CONFIG0, fifo_cfg[0]);
+		ret |= icm_write(&data->bus, ICM45686_FIFO_CONFIG0, fifo_cfg[0]);
 		fifo_cfg[4] |= BIT(0);
-		ret |= icm_write(&cfg->bus, ICM45686_FIFO_CONFIG3, fifo_cfg[4]);
+		ret |= icm_write(&data->bus, ICM45686_FIFO_CONFIG3, fifo_cfg[4]);
 	}
 	if (ret) {
 		LOG_ERR("FIFO config failed: %d", ret);
@@ -529,7 +580,7 @@ static int icm_init(const struct device *dev)
 	{
 		uint16_t check = 0;
 		k_sleep(K_MSEC(15));
-		read_fifo_count(&cfg->bus, &check);
+		read_fifo_count(&data->bus, &check);
 		if (check == 0) {
 			LOG_WRN("FIFO empty after startup — check I2C wiring / INT pin");
 		} else {
